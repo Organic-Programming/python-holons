@@ -1,8 +1,15 @@
-"""Tests for holons.transport — listener factory."""
+"""Tests for holons.transport — listener factory and URI parsing."""
 
 import socket
 
-from holons.transport import listen, scheme, MemListener, DEFAULT_URI
+from holons.transport import (
+    DEFAULT_URI,
+    MemListener,
+    ParsedURI,
+    listen,
+    parse_uri,
+    scheme,
+)
 
 
 def test_scheme_extraction():
@@ -18,19 +25,40 @@ def test_default_uri():
     assert DEFAULT_URI == "tcp://:9090"
 
 
+def test_parse_uri_tcp():
+    parsed = parse_uri("tcp://127.0.0.1:9090")
+    assert parsed == ParsedURI(raw="tcp://127.0.0.1:9090", scheme="tcp", host="127.0.0.1", port=9090)
+
+
+def test_parse_uri_wss_default_path():
+    parsed = parse_uri("wss://example.com:8443")
+    assert parsed.scheme == "wss"
+    assert parsed.secure is True
+    assert parsed.path == "/grpc"
+    assert parsed.port == 8443
+
+
+def test_parse_uri_ws_custom_path():
+    parsed = parse_uri("ws://127.0.0.1:8080/holon")
+    assert parsed.scheme == "ws"
+    assert parsed.path == "/holon"
+
+
 def test_tcp_listen():
     sock = listen("tcp://127.0.0.1:0")
     try:
         assert isinstance(sock, socket.socket)
         addr = sock.getsockname()
         assert addr[0] == "127.0.0.1"
-        assert addr[1] > 0  # ephemeral port
+        assert addr[1] > 0
     finally:
         sock.close()
 
 
 def test_unix_listen():
-    import tempfile, os
+    import os
+    import tempfile
+
     path = os.path.join(tempfile.gettempdir(), "holons_test.sock")
     sock = listen(f"unix://{path}")
     try:
@@ -60,6 +88,17 @@ def test_mem_listener_roundtrip():
 def test_mem_listen_via_uri():
     lis = listen("mem://")
     assert isinstance(lis, MemListener)
+    lis.close()
+
+
+def test_stdio_listener_single_use():
+    lis = listen("stdio://")
+    lis.accept()
+    try:
+        lis.accept()
+        assert False, "should have raised"
+    except StopIteration as e:
+        assert "single-use" in str(e)
     lis.close()
 
 

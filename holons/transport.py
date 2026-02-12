@@ -11,37 +11,48 @@ Supported transport URIs:
     wss://<host>:<port>   — WebSocket over TLS
 """
 
+from dataclasses import dataclass
+import asyncio
 import os
 import queue
 import socket
 import threading
-from typing import Tuple
+from typing import Any
 
 DEFAULT_URI = "tcp://:9090"
 
 
-def listen(uri: str) -> socket.socket:
-    """Parse a transport URI and return a bound server socket.
+@dataclass(frozen=True)
+class ParsedURI:
+    raw: str
+    scheme: str
+    host: str | None = None
+    port: int | None = None
+    path: str | None = None
+    secure: bool = False
 
-    For non-socket transports (stdio, mem, ws), returns a wrapper
-    that behaves like a socket for gRPC's add_insecure_port or
-    custom server loops.
-    """
-    if uri.startswith("tcp://"):
-        return _listen_tcp(uri[6:])
-    elif uri.startswith("unix://"):
-        return _listen_unix(uri[7:])
-    elif uri in ("stdio://", "stdio"):
-        return _StdioListener()
-    elif uri.startswith("mem://"):
+
+def listen(uri: str) -> Any:
+    """Parse a transport URI and return a bound listener."""
+    parsed = parse_uri(uri)
+
+    if parsed.scheme == "tcp":
+        return _listen_tcp(parsed)
+    if parsed.scheme == "unix":
+        return _listen_unix(parsed)
+    if parsed.scheme == "stdio":
+        return StdioListener()
+    if parsed.scheme == "mem":
         return MemListener()
-    elif uri.startswith("ws://") or uri.startswith("wss://"):
-        return _listen_ws(uri)
-    else:
-        raise ValueError(
-            f"unsupported transport URI: {uri!r} "
-            "(expected tcp://, unix://, stdio://, mem://, or ws://)"
-        )
+    if parsed.scheme in {"ws", "wss"}:
+        listener = WSListener(parsed)
+        listener.start()
+        return listener
+
+    raise ValueError(
+        f"unsupported transport URI: {uri!r} "
+        "(expected tcp://, unix://, stdio://, mem://, ws://, or wss://)"
+    )
 
 
 def scheme(uri: str) -> str:
@@ -50,23 +61,63 @@ def scheme(uri: str) -> str:
     return uri[:idx] if idx >= 0 else uri
 
 
+def parse_uri(uri: str) -> ParsedURI:
+    """Parse a transport URI into a normalized structure."""
+    s = scheme(uri)
+
+    if s == "tcp":
+        addr = uri[6:]
+        host, port = _split_host_port(addr, default_port=9090)
+        return ParsedURI(raw=uri, scheme="tcp", host=host, port=port)
+
+    if s == "unix":
+        path = uri[7:]
+        if not path:
+            raise ValueError(f"invalid unix:// URI: {uri!r}")
+        return ParsedURI(raw=uri, scheme="unix", path=path)
+
+    if s == "stdio":
+        return ParsedURI(raw="stdio://", scheme="stdio")
+
+    if s == "mem":
+        return ParsedURI(raw=uri if uri.startswith("mem://") else "mem://", scheme="mem")
+
+    if s in {"ws", "wss"}:
+        secure = s == "wss"
+        trimmed = uri[(7 if secure else 5):]
+        if "/" in trimmed:
+            addr, path = trimmed.split("/", 1)
+            path = "/" + path
+        else:
+            addr = trimmed
+            path = "/grpc"
+        host, port = _split_host_port(addr, default_port=(443 if secure else 80))
+        return ParsedURI(
+            raw=uri,
+            scheme=s,
+            host=host,
+            port=port,
+            path=path,
+            secure=secure,
+        )
+
+    raise ValueError(f"unsupported transport URI: {uri!r}")
+
+
 # --- TCP ---
 
-def _listen_tcp(addr: str) -> socket.socket:
-    host, _, port = addr.rpartition(":")
-    if not host:
-        host = "0.0.0.0"
+def _listen_tcp(parsed: ParsedURI) -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((host, int(port)))
+    sock.bind((parsed.host or "0.0.0.0", int(parsed.port or 9090)))
     sock.listen(128)
     return sock
 
 
 # --- Unix ---
 
-def _listen_unix(path: str) -> socket.socket:
-    # Clean stale socket
+def _listen_unix(parsed: ParsedURI) -> socket.socket:
+    path = str(parsed.path)
     try:
         os.unlink(path)
     except FileNotFoundError:
@@ -79,31 +130,23 @@ def _listen_unix(path: str) -> socket.socket:
 
 # --- Stdio ---
 
-class _StdioListener:
-    """Wraps stdin/stdout as a single-connection listener.
-
-    gRPC Python doesn't support custom listeners directly, so this
-    exposes the file descriptors for use with a custom server loop.
-    """
+class StdioListener:
+    """Wraps stdin/stdout as a single-connection listener."""
 
     def __init__(self):
         self.stdin_fd = os.dup(0)
         self.stdout_fd = os.dup(1)
         self._consumed = False
 
-    def accept(self) -> Tuple[int, int]:
-        """Return (read_fd, write_fd) for the single connection."""
+    def accept(self) -> tuple[int, int]:
         if self._consumed:
             raise StopIteration("stdio listener is single-use")
         self._consumed = True
         return self.stdin_fd, self.stdout_fd
 
-    def close(self):
+    def close(self) -> None:
         os.close(self.stdin_fd)
         os.close(self.stdout_fd)
-
-    def fileno(self):
-        return self.stdin_fd
 
     @property
     def address(self) -> str:
@@ -113,32 +156,26 @@ class _StdioListener:
 # --- Mem (in-process) ---
 
 class MemListener:
-    """In-process listener using socket pairs for testing.
-
-    Creates connected socket pairs on demand — both server and client
-    live in the same process.
-    """
+    """In-process listener using socket pairs for testing."""
 
     def __init__(self):
-        self._server_sockets = queue.Queue()
+        self._server_sockets: "queue.Queue[socket.socket]" = queue.Queue()
         self._closed = False
 
     def dial(self) -> socket.socket:
-        """Client side: create a connection to the in-process server."""
         if self._closed:
             raise ConnectionError("mem listener is closed")
         client, server = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         self._server_sockets.put(server)
         return client
 
-    def accept(self, timeout: float = None) -> socket.socket:
-        """Server side: accept the next in-process connection."""
+    def accept(self, timeout: float | None = None) -> socket.socket:
         try:
             return self._server_sockets.get(timeout=timeout)
-        except queue.Empty:
-            raise TimeoutError("no connection available")
+        except queue.Empty as exc:
+            raise TimeoutError("no connection available") from exc
 
-    def close(self):
+    def close(self) -> None:
         self._closed = True
 
     @property
@@ -148,83 +185,78 @@ class MemListener:
 
 # --- WebSocket ---
 
-def _listen_ws(uri: str):
-    """Start a WebSocket listener using the websockets library.
-
-    Returns a WSListener that wraps accepted WebSocket connections
-    as bidirectional byte streams compatible with gRPC.
-    """
-    return WSListener(uri)
-
-
 class WSListener:
-    """WebSocket listener that adapts WS connections for gRPC."""
+    """WebSocket listener that accepts grpc-subprotocol connections."""
 
-    def __init__(self, uri: str):
-        self.uri = uri
-        self.is_tls = uri.startswith("wss://")
-        trimmed = uri.replace("wss://", "").replace("ws://", "")
-
-        # Split host:port from path
-        if "/" in trimmed:
-            addr, self.path = trimmed.split("/", 1)
-            self.path = "/" + self.path
-        else:
-            addr = trimmed
-            self.path = "/grpc"
-
-        host, _, port = addr.rpartition(":")
-        self.host = host or "0.0.0.0"
-        self.port = int(port)
-        self._connections = queue.Queue()
+    def __init__(self, parsed: ParsedURI):
+        self.parsed = parsed
+        self.host = parsed.host or "0.0.0.0"
+        self.port = int(parsed.port or (443 if parsed.secure else 80))
+        self.path = parsed.path or "/grpc"
+        self._connections: "queue.Queue[Any]" = queue.Queue()
         self._server = None
-        self._thread = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
+        self._ready = threading.Event()
 
-    def start(self):
-        """Start the WebSocket server in a background thread."""
-        import asyncio
-        import websockets.server
+    def start(self) -> None:
+        import websockets
 
         async def _handler(websocket):
-            """Accept a WS connection, wrap it, put it in the queue."""
             self._connections.put(websocket)
-            # Keep connection alive until closed
             try:
                 await websocket.wait_closed()
             except Exception:
                 pass
 
-        async def _serve():
-            self._server = await websockets.server.serve(
+        async def _serve() -> None:
+            self._server = await websockets.serve(
                 _handler,
                 self.host,
                 self.port,
                 subprotocols=["grpc"],
+                process_request=self._path_guard,
             )
-            # Update port if ephemeral
-            for s in self._server.sockets:
-                addr = s.getsockname()
-                self.port = addr[1]
-                break
+            sockets = getattr(self._server, "sockets", [])
+            if sockets:
+                self.port = sockets[0].getsockname()[1]
+            self._ready.set()
             await self._server.wait_closed()
 
-        def _run():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(_serve())
+        def _run() -> None:
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
+            self._loop.run_until_complete(_serve())
 
         self._thread = threading.Thread(target=_run, daemon=True)
         self._thread.start()
+        self._ready.wait(timeout=5.0)
 
     def accept(self, timeout: float = 5.0):
-        """Accept the next WebSocket connection."""
         return self._connections.get(timeout=timeout)
 
-    def close(self):
-        if self._server:
-            self._server.close()
+    def close(self) -> None:
+        if self._server and self._loop:
+            self._loop.call_soon_threadsafe(self._server.close)
 
     @property
     def address(self) -> str:
-        scheme = "wss" if self.is_tls else "ws"
-        return f"{scheme}://{self.host}:{self.port}{self.path}"
+        s = "wss" if self.parsed.secure else "ws"
+        return f"{s}://{self.host}:{self.port}{self.path}"
+
+    async def _path_guard(self, path, request_headers):  # pragma: no cover
+        if path != self.path:
+            return (404, [], b"not found")
+        return None
+
+
+def _split_host_port(addr: str, default_port: int) -> tuple[str, int]:
+    if not addr:
+        return "0.0.0.0", default_port
+
+    if ":" not in addr:
+        return addr, default_port
+
+    host, _, port = addr.rpartition(":")
+    host = host or "0.0.0.0"
+    return host, int(port) if port else default_port

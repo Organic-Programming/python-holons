@@ -17,10 +17,8 @@ status: draft
 ---
 # python-holons
 
-**Python SDK for Organic Programming** — transport, serve, and identity
-utilities for building holons in Python.
-
-> *"Organic Programming SDK for Python."*
+**Python SDK for Organic Programming** — transport, serve, identity,
+and grpc client utilities.
 
 ## Install
 
@@ -30,26 +28,33 @@ pip install holons
 pip install -e .
 ```
 
-## Quick start
-
-```python
-from holons.serve import run
-from holons.transport import listen
-
-# Start a gRPC server on any transport
-run("tcp://:9090", register_services)
-run("unix:///tmp/my.sock", register_services)
-run("ws://0.0.0.0:8080", register_services)
-run("stdio://", register_services)
-```
-
 ## API surface
 
 | Module | Description |
 |--------|-------------|
-| `holons.transport` | `listen(uri)` — URI-based listener factory (tcp, unix, stdio, mem, ws) |
-| `holons.serve` | `run(uri, register_fn)` — start gRPC server with graceful shutdown |
-| `holons.identity` | `parse_holon(path)` — parse HOLON.md identity files |
+| `holons.transport` | `listen(uri)`, `parse_uri(uri)`, `scheme(uri)` |
+| `holons.serve` | `parse_flags(args)`, `run_with_options(uri, register_fn, ...)` |
+| `holons.identity` | `parse_holon(path)` |
+| `holons.grpcclient` | `dial`, `dial_uri`, `dial_mem` |
+
+## Transport URI support
+
+Recognized URI schemes:
+
+- `tcp://`
+- `unix://`
+- `stdio://`
+- `mem://`
+- `ws://`
+- `wss://`
+
+`serve.run_with_options(...)` supports:
+
+- native gRPC: `tcp://`, `unix://`
+- in-process adapter: `mem://`
+
+For `stdio://` and `ws://`/`wss://` server loops, use `holons.transport.listen()`
+with a custom runner.
 
 ## Test
 

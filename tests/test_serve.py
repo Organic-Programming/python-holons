@@ -15,3 +15,7 @@ def test_parse_port():
 def test_parse_default():
     assert parse_flags([]) == DEFAULT_URI
     assert parse_flags(["--verbose"]) == DEFAULT_URI
+
+
+def test_parse_listen_mem():
+    assert parse_flags(["--listen", "mem://"]) == "mem://"
