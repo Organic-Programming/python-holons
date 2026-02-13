@@ -71,7 +71,7 @@ with a custom runner.
 `HolonRPCServer` provides server-side promotion for Phase 3:
 
 - accepts WebSocket connections (configurable `ws://` / `wss://` URL)
-- negotiates `holon-rpc` subprotocol (`holon-web` accepted for js-web compatibility)
+- negotiates `holon-rpc` subprotocol only
 - dispatches incoming method calls via `register(...)`
 - supports server-initiated calls to connected clients via `invoke(...)`
 

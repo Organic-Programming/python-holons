@@ -401,7 +401,6 @@ class HolonRPCClient:
 class _ServerPeer:
     id: str
     websocket: Any
-    protocol: str
     pending: dict[str, asyncio.Future[Any]] = field(default_factory=dict)
 
 
@@ -457,7 +456,7 @@ class HolonRPCServer:
             self._handle_connection,
             host,
             port,
-            subprotocols=["holon-rpc", "holon-web"],
+            subprotocols=["holon-rpc"],
             ping_interval=None,
             ping_timeout=None,
             ssl=self._ssl_context if parsed.scheme == "wss" else None,
@@ -508,20 +507,12 @@ class HolonRPCServer:
         fut: asyncio.Future[Any] = loop.create_future()
         peer.pending[req_id] = fut
 
-        payload: JsonObject
-        if peer.protocol == "holon-web":
-            payload = {
-                "id": req_id,
-                "method": method,
-                "payload": params if params is not None else {},
-            }
-        else:
-            payload = {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "method": method,
-                "params": params if params is not None else {},
-            }
+        payload: JsonObject = {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "method": method,
+            "params": params if params is not None else {},
+        }
 
         try:
             await self._send_json(peer.websocket, payload)
@@ -544,13 +535,13 @@ class HolonRPCServer:
             return
 
         protocol = websocket.subprotocol or ""
-        if protocol not in {"holon-rpc", "holon-web"}:
+        if protocol != "holon-rpc":
             await websocket.close(code=1002, reason="missing holon-rpc subprotocol")
             return
 
         self._next_client_id += 1
         client_id = f"c{self._next_client_id}"
-        peer = _ServerPeer(id=client_id, websocket=websocket, protocol=protocol)
+        peer = _ServerPeer(id=client_id, websocket=websocket)
         self._clients[client_id] = peer
         self._connections.put_nowait(client_id)
 
@@ -589,7 +580,7 @@ class HolonRPCServer:
         method = payload.get("method")
         req_id = payload.get("id")
 
-        if peer.protocol == "holon-rpc" and payload.get("jsonrpc") != "2.0":
+        if payload.get("jsonrpc") != "2.0":
             if req_id is not None:
                 await self._send_error(peer, req_id, -32600, "invalid request")
             return
@@ -599,15 +590,12 @@ class HolonRPCServer:
                 await self._send_error(peer, req_id, -32600, "invalid request")
             return
 
-        if method in {"rpc.heartbeat", "holon-web/Heartbeat"}:
+        if method == "rpc.heartbeat":
             if req_id is not None:
                 await self._send_result(peer, req_id, {})
             return
 
-        if peer.protocol == "holon-web":
-            params = payload.get("payload", {})
-        else:
-            params = payload.get("params", {})
+        params = payload.get("params", {})
         if not isinstance(params, dict):
             if req_id is not None:
                 await self._send_error(peer, req_id, -32602, "params must be an object")
@@ -647,7 +635,7 @@ class HolonRPCServer:
         if fut is None or fut.done():
             return
 
-        if peer.protocol == "holon-rpc" and payload.get("jsonrpc") != "2.0":
+        if payload.get("jsonrpc") != "2.0":
             fut.set_exception(HolonRPCError(-32600, "invalid response"))
             return
 
@@ -661,17 +649,11 @@ class HolonRPCServer:
         fut.set_result(payload.get("result", {}))
 
     async def _send_result(self, peer: _ServerPeer, req_id: Any, result: JsonObject) -> None:
-        if peer.protocol == "holon-web":
-            payload: JsonObject = {
-                "id": req_id,
-                "result": result,
-            }
-        else:
-            payload = {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": result,
-            }
+        payload: JsonObject = {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": result,
+        }
         await self._send_json(peer.websocket, payload)
 
     async def _send_error(
@@ -687,17 +669,11 @@ class HolonRPCServer:
         if data is not None:
             err["data"] = data
 
-        if peer.protocol == "holon-web":
-            payload: JsonObject = {
-                "id": req_id,
-                "error": err,
-            }
-        else:
-            payload = {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "error": err,
-            }
+        payload: JsonObject = {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": err,
+        }
         await self._send_json(peer.websocket, payload)
 
     async def _send_json(self, ws: Any, payload: JsonObject) -> None:
