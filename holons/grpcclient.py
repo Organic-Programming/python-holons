@@ -27,6 +27,18 @@ def dial_mem(uri: str = "mem://") -> grpc.Channel:
     return grpc.insecure_channel(target)
 
 
+def dial_stdio(*_args, **_kwargs) -> grpc.Channel:
+    """Dial gRPC over stdio pipes.
+
+    grpcio does not expose a public transport hook to bind client channels
+    directly to stdin/stdout byte streams (unlike Go's custom dialer path).
+    """
+    raise NotImplementedError(
+        "dial_stdio is not available in python-holons: grpcio has no public stdio transport "
+        "adapter for HTTP/2 framing"
+    )
+
+
 def dial_uri(uri: str) -> grpc.Channel:
     """Dial using a transport URI.
 

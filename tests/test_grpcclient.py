@@ -2,7 +2,7 @@
 
 import grpc
 
-from holons.grpcclient import dial, dial_mem, dial_uri
+from holons.grpcclient import dial, dial_mem, dial_stdio, dial_uri
 from holons.runtime_state import register_mem_endpoint, unregister_mem_endpoint
 
 
@@ -46,3 +46,11 @@ def test_dial_uri_unsupported_scheme():
         assert False, "should have raised"
     except ValueError as e:
         assert "supports tcp://, unix://, and mem://" in str(e)
+
+
+def test_dial_stdio_not_implemented():
+    try:
+        dial_stdio("python", "fake-holon.py")
+        assert False, "should have raised"
+    except NotImplementedError as e:
+        assert "no public stdio transport adapter" in str(e)
