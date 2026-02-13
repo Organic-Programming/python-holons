@@ -10,11 +10,13 @@ Protocol constraints (PROTOCOL.md §4):
 
 from collections.abc import Awaitable, Callable
 import asyncio
+from dataclasses import dataclass, field
 import inspect
 import json
 import logging
 import random
 from typing import Any
+from urllib.parse import urlparse
 
 import websockets
 from websockets.exceptions import ConnectionClosed
@@ -390,6 +392,321 @@ class HolonRPCClient:
     def _fail_pending(self, exc: Exception) -> None:
         pending = list(self._pending.values())
         self._pending.clear()
+        for fut in pending:
+            if not fut.done():
+                fut.set_exception(exc)
+
+
+@dataclass
+class _ServerPeer:
+    id: str
+    websocket: Any
+    protocol: str
+    pending: dict[str, asyncio.Future[Any]] = field(default_factory=dict)
+
+
+class HolonRPCServer:
+    """Holon-RPC server (JSON-RPC 2.0 over WebSocket) with bidirectional calls."""
+
+    def __init__(self, url: str = "ws://127.0.0.1:0/rpc", *, ssl_context: Any | None = None):
+        self._url = url
+        self._ssl_context = ssl_context
+
+        self._handlers: dict[str, RPCHandler] = {}
+        self._clients: dict[str, _ServerPeer] = {}
+        self._connections: "asyncio.Queue[str]" = asyncio.Queue()
+
+        self._server: Any | None = None
+        self._next_client_id = 0
+        self._next_server_id = 0
+        self._send_lock = asyncio.Lock()
+        self._closed = False
+        self.address = url
+        self._path = "/rpc"
+
+    def register(self, method: str, handler: RPCHandler) -> None:
+        if not method:
+            raise ValueError("method is required")
+        self._handlers[method] = handler
+
+    def unregister(self, method: str) -> None:
+        self._handlers.pop(method, None)
+
+    def client_ids(self) -> list[str]:
+        return list(self._clients.keys())
+
+    async def wait_for_client(self, timeout: float = 5.0) -> str:
+        return await asyncio.wait_for(self._connections.get(), timeout=timeout)
+
+    async def start(self) -> str:
+        if self._server is not None:
+            return self.address
+
+        parsed = urlparse(self._url)
+        if parsed.scheme not in {"ws", "wss"}:
+            raise ValueError(f"holon-rpc server requires ws:// or wss:// URL, got {self._url!r}")
+        if parsed.scheme == "wss" and self._ssl_context is None:
+            raise ValueError("wss:// holon-rpc server requires ssl_context")
+
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port if parsed.port is not None else (443 if parsed.scheme == "wss" else 80)
+        self._path = parsed.path or "/rpc"
+
+        self._closed = False
+        self._server = await websockets.serve(
+            self._handle_connection,
+            host,
+            port,
+            subprotocols=["holon-rpc", "holon-web"],
+            ping_interval=None,
+            ping_timeout=None,
+            ssl=self._ssl_context if parsed.scheme == "wss" else None,
+        )
+
+        sockets = getattr(self._server, "sockets", [])
+        if sockets:
+            bound_port = sockets[0].getsockname()[1]
+        else:
+            bound_port = port
+        self.address = f"{parsed.scheme}://{host}:{bound_port}{self._path}"
+        return self.address
+
+    async def close(self) -> None:
+        self._closed = True
+        peers = list(self._clients.values())
+        self._clients.clear()
+
+        for peer in peers:
+            self._fail_peer_pending(peer, ConnectionError("holon-rpc server closed"))
+            try:
+                await peer.websocket.close(code=1001, reason="server shutdown")
+            except Exception:
+                pass
+
+        if self._server is not None:
+            self._server.close()
+            await self._server.wait_closed()
+            self._server = None
+
+    async def invoke(
+        self,
+        client_id: str,
+        method: str,
+        params: JsonObject | None = None,
+        *,
+        timeout: float = 5.0,
+    ) -> JsonObject:
+        peer = self._clients.get(client_id)
+        if peer is None:
+            raise ConnectionError(f"unknown client: {client_id}")
+        if not method:
+            raise ValueError("method is required")
+
+        self._next_server_id += 1
+        req_id = f"s{self._next_server_id}"
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[Any] = loop.create_future()
+        peer.pending[req_id] = fut
+
+        payload: JsonObject
+        if peer.protocol == "holon-web":
+            payload = {
+                "id": req_id,
+                "method": method,
+                "payload": params if params is not None else {},
+            }
+        else:
+            payload = {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": method,
+                "params": params if params is not None else {},
+            }
+
+        try:
+            await self._send_json(peer.websocket, payload)
+            out = await asyncio.wait_for(fut, timeout=timeout)
+            if isinstance(out, dict):
+                return out
+            return {"value": out}
+        finally:
+            peer.pending.pop(req_id, None)
+
+    async def _handle_connection(self, websocket: Any) -> None:
+        path = getattr(websocket, "path", None)
+        if not path:
+            request = getattr(websocket, "request", None)
+            path = getattr(request, "path", None)
+        if not path:
+            path = self._path
+        if path != self._path:
+            await websocket.close(code=1008, reason="invalid path")
+            return
+
+        protocol = websocket.subprotocol or ""
+        if protocol not in {"holon-rpc", "holon-web"}:
+            await websocket.close(code=1002, reason="missing holon-rpc subprotocol")
+            return
+
+        self._next_client_id += 1
+        client_id = f"c{self._next_client_id}"
+        peer = _ServerPeer(id=client_id, websocket=websocket, protocol=protocol)
+        self._clients[client_id] = peer
+        self._connections.put_nowait(client_id)
+
+        try:
+            async for message in websocket:
+                if not isinstance(message, str):
+                    continue
+                await self._handle_message(peer, message)
+        except ConnectionClosed:
+            pass
+        finally:
+            self._clients.pop(client_id, None)
+            self._fail_peer_pending(peer, ConnectionError("holon-rpc connection closed"))
+
+    async def _handle_message(self, peer: _ServerPeer, raw: str) -> None:
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            await self._send_error(peer, None, -32700, "parse error")
+            return
+
+        if not isinstance(payload, dict):
+            await self._send_error(peer, None, -32600, "invalid request")
+            return
+
+        if "method" in payload:
+            await self._handle_request(peer, payload)
+            return
+        if "result" in payload or "error" in payload:
+            self._handle_response(peer, payload)
+            return
+
+        await self._send_error(peer, payload.get("id"), -32600, "invalid request")
+
+    async def _handle_request(self, peer: _ServerPeer, payload: JsonObject) -> None:
+        method = payload.get("method")
+        req_id = payload.get("id")
+
+        if peer.protocol == "holon-rpc" and payload.get("jsonrpc") != "2.0":
+            if req_id is not None:
+                await self._send_error(peer, req_id, -32600, "invalid request")
+            return
+
+        if not isinstance(method, str) or not method:
+            if req_id is not None:
+                await self._send_error(peer, req_id, -32600, "invalid request")
+            return
+
+        if method in {"rpc.heartbeat", "holon-web/Heartbeat"}:
+            if req_id is not None:
+                await self._send_result(peer, req_id, {})
+            return
+
+        if peer.protocol == "holon-web":
+            params = payload.get("payload", {})
+        else:
+            params = payload.get("params", {})
+        if not isinstance(params, dict):
+            if req_id is not None:
+                await self._send_error(peer, req_id, -32602, "params must be an object")
+            return
+
+        handler = self._handlers.get(method)
+        if handler is None:
+            if req_id is not None:
+                await self._send_error(peer, req_id, -32601, f"method {method!r} not found")
+            return
+
+        try:
+            result = handler(params)
+            if inspect.isawaitable(result):
+                result = await result
+        except HolonRPCError as exc:
+            if req_id is not None:
+                await self._send_error(peer, req_id, exc.code, exc.message, data=exc.data)
+            return
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            if req_id is not None:
+                await self._send_error(peer, req_id, 13, str(exc))
+            return
+
+        if req_id is not None:
+            if isinstance(result, dict):
+                await self._send_result(peer, req_id, result)
+            else:
+                await self._send_result(peer, req_id, {"value": result})
+
+    def _handle_response(self, peer: _ServerPeer, payload: JsonObject) -> None:
+        req_id = payload.get("id")
+        if req_id is None:
+            return
+
+        fut = peer.pending.get(str(req_id))
+        if fut is None or fut.done():
+            return
+
+        if peer.protocol == "holon-rpc" and payload.get("jsonrpc") != "2.0":
+            fut.set_exception(HolonRPCError(-32600, "invalid response"))
+            return
+
+        if "error" in payload:
+            error = payload.get("error") or {}
+            code = int(error.get("code", -32603))
+            message = str(error.get("message", "internal error"))
+            fut.set_exception(HolonRPCError(code, message, error.get("data")))
+            return
+
+        fut.set_result(payload.get("result", {}))
+
+    async def _send_result(self, peer: _ServerPeer, req_id: Any, result: JsonObject) -> None:
+        if peer.protocol == "holon-web":
+            payload: JsonObject = {
+                "id": req_id,
+                "result": result,
+            }
+        else:
+            payload = {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": result,
+            }
+        await self._send_json(peer.websocket, payload)
+
+    async def _send_error(
+        self,
+        peer: _ServerPeer,
+        req_id: Any,
+        code: int,
+        message: str,
+        *,
+        data: Any | None = None,
+    ) -> None:
+        err: JsonObject = {"code": int(code), "message": str(message)}
+        if data is not None:
+            err["data"] = data
+
+        if peer.protocol == "holon-web":
+            payload: JsonObject = {
+                "id": req_id,
+                "error": err,
+            }
+        else:
+            payload = {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": err,
+            }
+        await self._send_json(peer.websocket, payload)
+
+    async def _send_json(self, ws: Any, payload: JsonObject) -> None:
+        async with self._send_lock:
+            await ws.send(json.dumps(payload, separators=(",", ":")))
+
+    def _fail_peer_pending(self, peer: _ServerPeer, exc: Exception) -> None:
+        pending = list(peer.pending.values())
+        peer.pending.clear()
         for fut in pending:
             if not fut.done():
                 fut.set_exception(exc)

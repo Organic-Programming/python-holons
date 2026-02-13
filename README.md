@@ -35,8 +35,8 @@ pip install -e .
 | `holons.transport` | `listen(uri)`, `parse_uri(uri)`, `scheme(uri)` |
 | `holons.serve` | `parse_flags(args)`, `run_with_options(uri, register_fn, ...)` |
 | `holons.identity` | `parse_holon(path)` |
-| `holons.grpcclient` | `dial`, `dial_uri`, `dial_mem` |
-| `holons.holonrpc` | `HolonRPCClient.connect/invoke/register/close` |
+| `holons.grpcclient` | `dial`, `dial_uri`, `dial_mem`, `dial_websocket` |
+| `holons.holonrpc` | `HolonRPCClient` + `HolonRPCServer` |
 
 ## Transport URI support
 
@@ -68,13 +68,22 @@ with a custom runner.
 - heartbeat: `rpc.heartbeat`
 - reconnect: exponential backoff
 
+`HolonRPCServer` provides server-side promotion for Phase 3:
+
+- accepts WebSocket connections (configurable `ws://` / `wss://` URL)
+- negotiates `holon-rpc` subprotocol (`holon-web` accepted for js-web compatibility)
+- dispatches incoming method calls via `register(...)`
+- supports server-initiated calls to connected clients via `invoke(...)`
+
 ## Parity Notes vs Go Reference
 
 Implemented:
 
 - Holon-RPC client (connect/invoke/register/close, heartbeat, reconnect)
+- Holon-RPC server (bidirectional JSON-RPC 2.0 over WebSocket)
 - gRPC listen/dial on `tcp://` and `unix://`
 - in-process `mem://` adapter for tests/composition
+- gRPC `ws://` / `wss://` dial via local TCP↔WebSocket tunnel bridge
 
 Not currently achievable in pure `grpcio` (justified gap):
 

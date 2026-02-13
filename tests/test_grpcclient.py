@@ -2,7 +2,7 @@
 
 import grpc
 
-from holons.grpcclient import dial, dial_mem, dial_stdio, dial_uri
+from holons.grpcclient import dial, dial_mem, dial_stdio, dial_uri, dial_websocket
 from holons.runtime_state import register_mem_endpoint, unregister_mem_endpoint
 
 
@@ -42,10 +42,18 @@ def test_dial_mem_missing_endpoint():
 
 def test_dial_uri_unsupported_scheme():
     try:
-        dial_uri("ws://127.0.0.1:8080/grpc")
+        dial_uri("ftp://127.0.0.1:21")
         assert False, "should have raised"
     except ValueError as e:
-        assert "supports tcp://, unix://, and mem://" in str(e)
+        assert "unsupported transport URI" in str(e)
+
+
+def test_dial_websocket_requires_ws_scheme():
+    try:
+        dial_websocket("tcp://127.0.0.1:9090")
+        assert False, "should have raised"
+    except ValueError as e:
+        assert "expects ws:// or wss://" in str(e)
 
 
 def test_dial_stdio_not_implemented():
