@@ -9,6 +9,7 @@ import socket
 import subprocess
 import tempfile
 import threading
+import time
 from typing import Any, Callable
 
 import grpc
@@ -228,6 +229,7 @@ class _StdioDialProxy:
         self._closed = threading.Event()
         self._lock = threading.Lock()
         self._pending_stdout: list[bytes] = []
+        self._stderr_chunks: list[bytes] = []
         self.target: str | None = None
 
     def start(self) -> str:
@@ -262,6 +264,7 @@ class _StdioDialProxy:
             self._stderr_thread = threading.Thread(target=self._stderr_loop, daemon=True)
             self._stderr_thread.start()
 
+        self._raise_if_child_exited_early()
         return target
 
     def close(self) -> None:
@@ -383,7 +386,7 @@ class _StdioDialProxy:
 
         while not self._closed.is_set():
             try:
-                chunk = proc.stdout.read(64 * 1024)
+                chunk = _read_pipe_chunk(proc.stdout, 64 * 1024)
             except OSError:
                 break
 
@@ -418,11 +421,13 @@ class _StdioDialProxy:
 
         while not self._closed.is_set():
             try:
-                chunk = proc.stderr.read(64 * 1024)
+                chunk = _read_pipe_chunk(proc.stderr, 64 * 1024)
             except OSError:
                 break
             if not chunk:
                 return
+            with self._lock:
+                self._stderr_chunks.append(bytes(chunk))
 
     def _socket_to_stdin_loop(self, conn: socket.socket) -> None:
         proc = self._proc
@@ -479,6 +484,44 @@ class _StdioDialProxy:
         self._listen_dir = None
         if listen_dir:
             shutil.rmtree(listen_dir, ignore_errors=True)
+
+    def _raise_if_child_exited_early(self) -> None:
+        proc = self._proc
+        if proc is None:
+            return
+
+        deadline = time.time() + 0.25
+        while time.time() < deadline and not self._closed.is_set():
+            code = proc.poll()
+            if code is not None:
+                details = f"stdio child process exited with code {code}"
+                stderr_text = self._stderr_text()
+                if stderr_text:
+                    details = f"{details}: {stderr_text}"
+                self.close()
+                raise RuntimeError(details)
+            time.sleep(0.01)
+
+    def _stderr_text(self, limit: int = 4096) -> str:
+        with self._lock:
+            if not self._stderr_chunks:
+                return ""
+            raw = b"".join(self._stderr_chunks)
+
+        text = raw.decode("utf-8", errors="replace").strip()
+        if len(text) > limit:
+            return text[-limit:]
+        return text
+
+
+def _read_pipe_chunk(stream: Any, size: int) -> bytes:
+    read1 = getattr(stream, "read1", None)
+    if callable(read1):
+        return read1(size)
+    fileno = getattr(stream, "fileno", None)
+    if callable(fileno):
+        return os.read(fileno(), size)
+    return stream.read(size)
 
 
 def dial(address: str) -> grpc.Channel:

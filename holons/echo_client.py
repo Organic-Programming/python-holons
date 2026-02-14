@@ -70,11 +70,14 @@ def parse_args(argv: Sequence[str]) -> dict[str, Any]:
 
 
 def build_go_echo_server_command(go_binary: str, server_sdk: str) -> list[str]:
-    go_server_dir = Path(__file__).resolve().parents[2] / "go-holons" / "cmd" / "echo-server"
-    command = [go_binary, "run", str(go_server_dir), "--listen", "stdio://"]
+    command = [go_binary, "run", "./cmd/echo-server", "--listen", "stdio://"]
     if server_sdk:
         command.extend(["--sdk", server_sdk])
     return command
+
+
+def _go_holons_dir() -> Path:
+    return Path(__file__).resolve().parents[2] / "go-holons"
 
 
 def _invoke_ping(channel: Any, message: str, timeout_ms: int) -> dict[str, Any]:
@@ -106,6 +109,7 @@ def run(
             args["uri"],
             stdio_command=command,
             stdio_env=dict(os.environ),
+            stdio_cwd=str(_go_holons_dir()),
         )
     else:
         channel = dial_uri_fn(args["uri"])

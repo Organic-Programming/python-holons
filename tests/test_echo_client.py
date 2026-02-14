@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from holons.echo_client import (
     build_go_echo_server_command,
     parse_args,
@@ -63,6 +65,7 @@ def test_build_go_echo_server_command():
     command = build_go_echo_server_command("go", "go-holons")
     assert command[0] == "go"
     assert command[1] == "run"
+    assert command[2] == "./cmd/echo-server"
     assert command[3:] == ["--listen", "stdio://", "--sdk", "go-holons"]
 
 
@@ -85,8 +88,12 @@ def test_run_stdio_uses_child_command():
     assert captured["uri"] == "stdio://"
     command = captured["kwargs"]["stdio_command"]
     assert command[1] == "run"
+    assert command[2] == "./cmd/echo-server"
     assert command[-4:] == ["--listen", "stdio://", "--sdk", "go-holons"]
     assert "stdio_env" in captured["kwargs"]
+    go_cwd = Path(captured["kwargs"]["stdio_cwd"])
+    assert go_cwd.name == "go-holons"
+    assert go_cwd.parent.name == "sdk"
     assert result == {
         "status": "pass",
         "sdk": "python-holons",

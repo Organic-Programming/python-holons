@@ -109,6 +109,19 @@ def test_dial_uri_stdio_requires_command():
         dial_uri("stdio://")
 
 
+def test_dial_stdio_reports_child_startup_stderr():
+    shell = shutil.which("sh")
+    if not shell:
+        pytest.skip("sh not found")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        dial_stdio(shell, "-c", "echo stdio-start-failed >&2; exit 23")
+
+    msg = str(exc_info.value)
+    assert "exited with code 23" in msg
+    assert "stdio-start-failed" in msg
+
+
 def test_dial_stdio_go_echo_roundtrip():
     go_bin = _resolve_go_binary()
     sdk_dir = Path(__file__).resolve().parents[2]
