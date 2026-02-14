@@ -20,7 +20,10 @@
     "bidirectional": true,
     "valence": "multi",
     "routing": [
-      "unicast"
+      "unicast",
+      "fanout",
+      "broadcast-response",
+      "full-broadcast"
     ]
   },
   "last_certified": {
@@ -28,5 +31,5 @@
     "date": "2026-02-14",
     "level": 1
   },
-  "role": "client"
+  "role": "hub"
 }
