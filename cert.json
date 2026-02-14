@@ -20,7 +20,8 @@
     "bidirectional": true,
     "valence": "multi",
     "routing": [
-      "unicast"
+      "unicast",
+      "fanout"
     ]
   },
   "last_certified": {
