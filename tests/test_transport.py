@@ -2,6 +2,8 @@
 
 import socket
 
+import pytest
+
 from holons.transport import (
     DEFAULT_URI,
     MemListener,
@@ -10,6 +12,12 @@ from holons.transport import (
     parse_uri,
     scheme,
 )
+
+
+def _skip_if_bind_denied(exc: BaseException) -> None:
+    msg = str(exc).lower()
+    if isinstance(exc, PermissionError) or "operation not permitted" in msg:
+        pytest.skip(f"local bind denied in this environment: {exc}")
 
 
 def test_scheme_extraction():
@@ -45,7 +53,11 @@ def test_parse_uri_ws_custom_path():
 
 
 def test_tcp_listen():
-    sock = listen("tcp://127.0.0.1:0")
+    try:
+        sock = listen("tcp://127.0.0.1:0")
+    except (PermissionError, OSError) as exc:
+        _skip_if_bind_denied(exc)
+        raise
     try:
         assert isinstance(sock, socket.socket)
         addr = sock.getsockname()
@@ -60,7 +72,11 @@ def test_unix_listen():
     import tempfile
 
     path = os.path.join(tempfile.gettempdir(), "holons_test.sock")
-    sock = listen(f"unix://{path}")
+    try:
+        sock = listen(f"unix://{path}")
+    except (PermissionError, OSError) as exc:
+        _skip_if_bind_denied(exc)
+        raise
     try:
         assert isinstance(sock, socket.socket)
     finally:

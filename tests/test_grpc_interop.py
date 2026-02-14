@@ -10,6 +10,7 @@ import tempfile
 import textwrap
 from typing import Iterator
 
+import pytest
 from grpc_reflection.v1alpha import reflection_pb2, reflection_pb2_grpc
 
 from holons.grpcclient import dial_uri
@@ -135,6 +136,11 @@ def _resolve_go_binary() -> str:
     return found
 
 
+def _is_bind_denied(stderr: str) -> bool:
+    text = stderr.lower()
+    return "bind" in text and "operation not permitted" in text
+
+
 @contextmanager
 def _run_go_grpc_server() -> Iterator[str]:
     go_bin = _resolve_go_binary()
@@ -160,6 +166,8 @@ def _run_go_grpc_server() -> Iterator[str]:
             stderr = ""
             if proc.stderr is not None:
                 stderr = proc.stderr.read()
+            if _is_bind_denied(stderr):
+                pytest.skip("local bind denied in this environment")
             raise RuntimeError(f"failed to start Go gRPC helper: {stderr}")
         yield uri
     finally:
@@ -197,6 +205,8 @@ def _run_go_grpc_ws_server() -> Iterator[str]:
             stderr = ""
             if proc.stderr is not None:
                 stderr = proc.stderr.read()
+            if _is_bind_denied(stderr):
+                pytest.skip("local bind denied in this environment")
             raise RuntimeError(f"failed to start Go gRPC ws helper: {stderr}")
         yield uri
     finally:

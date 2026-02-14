@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import textwrap
 
+import pytest
 import websockets
 
 from holons.holonrpc import HolonRPCServer
@@ -26,7 +27,12 @@ def test_holonrpc_server_jsonrpc_roundtrip():
     async def _run() -> None:
         server = HolonRPCServer("ws://127.0.0.1:0/rpc")
         server.register("echo.v1.Echo/Ping", lambda params: params)
-        url = await server.start()
+        try:
+            url = await server.start()
+        except (PermissionError, OSError) as exc:
+            if "operation not permitted" in str(exc).lower():
+                pytest.skip(f"local bind denied in this environment: {exc}")
+            raise
 
         try:
             async with websockets.connect(url, subprotocols=["holon-rpc"]) as ws:
@@ -55,7 +61,12 @@ def test_holonrpc_server_js_web_bidirectional_roundtrip():
     async def _run() -> None:
         server = HolonRPCServer("ws://127.0.0.1:0/rpc")
         server.register("echo.v1.Echo/Ping", lambda params: params)
-        url = await server.start()
+        try:
+            url = await server.start()
+        except (PermissionError, OSError) as exc:
+            if "operation not permitted" in str(exc).lower():
+                pytest.skip(f"local bind denied in this environment: {exc}")
+            raise
 
         sdk_dir = Path(__file__).resolve().parents[2]
         node_bin = _resolve_node_binary()

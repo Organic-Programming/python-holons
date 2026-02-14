@@ -11,6 +11,8 @@ import tempfile
 import textwrap
 from typing import Iterator
 
+import pytest
+
 from holons.holonrpc import HolonRPCClient
 
 
@@ -235,6 +237,11 @@ def _resolve_go_binary() -> str:
     return found
 
 
+def _is_bind_denied(stderr: str) -> bool:
+    text = stderr.lower()
+    return "bind" in text and "operation not permitted" in text
+
+
 @contextmanager
 def _run_go_holonrpc_server(mode: str = "echo") -> Iterator[str]:
     go_bin = _resolve_go_binary()
@@ -260,6 +267,8 @@ def _run_go_holonrpc_server(mode: str = "echo") -> Iterator[str]:
             stderr = ""
             if proc.stderr is not None:
                 stderr = proc.stderr.read()
+            if _is_bind_denied(stderr):
+                pytest.skip("local bind denied in this environment")
             raise RuntimeError(f"failed to start Go holon-rpc helper: {stderr}")
         yield url
     finally:

@@ -1,6 +1,12 @@
 """Tests for holons.grpcclient."""
 
+import json
+from pathlib import Path
+import shutil
+import time
+
 import grpc
+import pytest
 
 from holons.grpcclient import dial, dial_mem, dial_stdio, dial_uri, dial_websocket
 from holons.runtime_state import register_mem_endpoint, unregister_mem_endpoint
@@ -56,9 +62,101 @@ def test_dial_websocket_requires_ws_scheme():
         assert "expects ws:// or wss://" in str(e)
 
 
-def test_dial_stdio_not_implemented():
+def _resolve_go_binary() -> str:
+    preferred = Path("/Users/bpds/go/go1.25.1/bin/go")
+    if preferred.exists():
+        return str(preferred)
+
+    found = shutil.which("go")
+    if not found:
+        pytest.skip("go binary not found")
+    return found
+
+
+def _invoke_echo_ping(channel: grpc.Channel, message: str) -> dict:
+    stub = channel.unary_unary(
+        "/echo.v1.Echo/Ping",
+        request_serializer=lambda value: json.dumps(value).encode("utf-8"),
+        response_deserializer=lambda raw: json.loads(raw.decode("utf-8")),
+    )
+    return stub({"message": message}, timeout=1.0)
+
+
+def _assert_echo_roundtrip(channel: grpc.Channel) -> None:
+    deadline = time.time() + 6.0
+    last_error = None
+    while time.time() < deadline:
+        try:
+            out = _invoke_echo_ping(channel, "hello-stdio")
+            assert out["message"] == "hello-stdio"
+            assert out["sdk"] == "go-holons"
+            return
+        except grpc.RpcError as exc:
+            last_error = exc
+            time.sleep(0.1)
+
+    assert False, f"stdio echo call did not succeed: {last_error}"
+
+
+def _skip_if_local_bind_denied(exc: BaseException) -> None:
+    msg = str(exc).lower()
+    if isinstance(exc, PermissionError) or "operation not permitted" in msg:
+        pytest.skip(f"local bind denied in this environment: {exc}")
+
+
+def test_dial_uri_stdio_requires_command():
+    with pytest.raises(ValueError, match="requires stdio_command"):
+        dial_uri("stdio://")
+
+
+def test_dial_stdio_go_echo_roundtrip():
+    go_bin = _resolve_go_binary()
+    sdk_dir = Path(__file__).resolve().parents[2]
+    go_holons_dir = sdk_dir / "go-holons"
+
     try:
-        dial_stdio("python", "fake-holon.py")
-        assert False, "should have raised"
-    except NotImplementedError as e:
-        assert "no public stdio transport adapter" in str(e)
+        ch = dial_stdio(
+            go_bin,
+            "run",
+            "./cmd/echo-server",
+            "--listen",
+            "stdio://",
+            "--sdk",
+            "go-holons",
+            cwd=str(go_holons_dir),
+        )
+    except (PermissionError, OSError) as exc:
+        _skip_if_local_bind_denied(exc)
+        raise
+    try:
+        _assert_echo_roundtrip(ch)
+    finally:
+        ch.close()
+
+
+def test_dial_uri_stdio_go_echo_roundtrip():
+    go_bin = _resolve_go_binary()
+    sdk_dir = Path(__file__).resolve().parents[2]
+    go_holons_dir = sdk_dir / "go-holons"
+
+    try:
+        ch = dial_uri(
+            "stdio://",
+            stdio_command=[
+                go_bin,
+                "run",
+                "./cmd/echo-server",
+                "--listen",
+                "stdio://",
+                "--sdk",
+                "go-holons",
+            ],
+            stdio_cwd=str(go_holons_dir),
+        )
+    except (PermissionError, OSError) as exc:
+        _skip_if_local_bind_denied(exc)
+        raise
+    try:
+        _assert_echo_roundtrip(ch)
+    finally:
+        ch.close()

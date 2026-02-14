@@ -15,7 +15,7 @@ import inspect
 import json
 import logging
 import random
-from typing import Any
+from typing import Any, Union
 from urllib.parse import urlparse
 
 import websockets
@@ -24,7 +24,7 @@ from websockets.exceptions import ConnectionClosed
 logger = logging.getLogger("holons.holonrpc")
 
 JsonObject = dict[str, Any]
-RPCHandler = Callable[[JsonObject], JsonObject | Awaitable[JsonObject]]
+RPCHandler = Callable[[JsonObject], Union[JsonObject, Awaitable[JsonObject]]]
 
 
 class HolonRPCError(Exception):

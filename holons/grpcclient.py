@@ -3,7 +3,11 @@ from __future__ import annotations
 """Client-side gRPC helpers for Python holons."""
 
 import asyncio
+import os
+import shutil
 import socket
+import subprocess
+import tempfile
 import threading
 from typing import Any, Callable
 
@@ -193,6 +197,290 @@ class _WSDialProxy:
                 _ = task.exception() if not task.cancelled() else None
 
 
+class _StdioDialProxy:
+    """Bridge child-process stdio pipes to a local gRPC dial target."""
+
+    def __init__(
+        self,
+        command: tuple[str, ...],
+        *,
+        env: dict[str, str] | None = None,
+        cwd: str | None = None,
+    ):
+        if not command:
+            raise ValueError("command is required")
+
+        self._command = list(command)
+        self._env = env
+        self._cwd = cwd
+
+        self._proc: subprocess.Popen | None = None
+        self._listen_socket: socket.socket | None = None
+        self._listen_path: str | None = None
+        self._listen_dir: str | None = None
+        self._conn: socket.socket | None = None
+
+        self._accept_thread: threading.Thread | None = None
+        self._stdout_thread: threading.Thread | None = None
+        self._stderr_thread: threading.Thread | None = None
+        self._socket_to_stdin_thread: threading.Thread | None = None
+
+        self._closed = threading.Event()
+        self._lock = threading.Lock()
+        self._pending_stdout: list[bytes] = []
+        self.target: str | None = None
+
+    def start(self) -> str:
+        if self.target:
+            return self.target
+
+        proc = subprocess.Popen(
+            self._command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=self._cwd,
+            env=self._env,
+        )
+        self._proc = proc
+
+        if proc.stdin is None or proc.stdout is None:
+            self.close()
+            raise RuntimeError("stdio child process must expose stdin/stdout pipes")
+
+        listen, target = self._create_listener()
+        self._listen_socket = listen
+        self.target = target
+
+        self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self._accept_thread.start()
+
+        self._stdout_thread = threading.Thread(target=self._stdout_loop, daemon=True)
+        self._stdout_thread.start()
+
+        if proc.stderr is not None:
+            self._stderr_thread = threading.Thread(target=self._stderr_loop, daemon=True)
+            self._stderr_thread.start()
+
+        return target
+
+    def close(self) -> None:
+        if self._closed.is_set():
+            return
+        self._closed.set()
+
+        listen = self._listen_socket
+        self._listen_socket = None
+        if listen is not None:
+            try:
+                listen.close()
+            except OSError:
+                pass
+
+        with self._lock:
+            conn = self._conn
+            self._conn = None
+
+        if conn is not None:
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+        proc = self._proc
+        self._proc = None
+        if proc is not None:
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                if stream is None:
+                    continue
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=1.5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=1.0)
+                except OSError:
+                    pass
+
+        self._cleanup_listener_path()
+
+    def _create_listener(self) -> tuple[socket.socket, str]:
+        if hasattr(socket, "AF_UNIX"):
+            listen_dir = tempfile.mkdtemp(prefix="holons-stdio-")
+            listen_path = os.path.join(listen_dir, "bridge.sock")
+            unix_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                unix_sock.bind(listen_path)
+                unix_sock.listen(1)
+                unix_sock.settimeout(0.2)
+                self._listen_dir = listen_dir
+                self._listen_path = listen_path
+                return unix_sock, f"unix://{listen_path}"
+            except OSError:
+                try:
+                    unix_sock.close()
+                except OSError:
+                    pass
+                shutil.rmtree(listen_dir, ignore_errors=True)
+
+        listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listen.bind(("127.0.0.1", 0))
+        listen.listen(1)
+        listen.settimeout(0.2)
+        host, port = listen.getsockname()
+        return listen, f"{host}:{port}"
+
+    def _accept_loop(self) -> None:
+        assert self._listen_socket is not None
+
+        while not self._closed.is_set():
+            try:
+                conn, _ = self._listen_socket.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            conn.settimeout(0.2)
+
+            with self._lock:
+                if self._conn is not None:
+                    conn.close()
+                    continue
+
+                self._conn = conn
+                pending = self._pending_stdout
+                self._pending_stdout = []
+
+            for chunk in pending:
+                try:
+                    conn.sendall(chunk)
+                except OSError:
+                    break
+
+            self._socket_to_stdin_thread = threading.Thread(
+                target=self._socket_to_stdin_loop,
+                args=(conn,),
+                daemon=True,
+            )
+            self._socket_to_stdin_thread.start()
+
+    def _stdout_loop(self) -> None:
+        proc = self._proc
+        if proc is None or proc.stdout is None:
+            return
+
+        while not self._closed.is_set():
+            try:
+                chunk = proc.stdout.read(64 * 1024)
+            except OSError:
+                break
+
+            if not chunk:
+                break
+
+            with self._lock:
+                conn = self._conn
+                if conn is None:
+                    self._pending_stdout.append(bytes(chunk))
+                    continue
+
+            try:
+                conn.sendall(chunk)
+            except OSError:
+                with self._lock:
+                    if self._conn is conn:
+                        self._conn = None
+
+        with self._lock:
+            conn = self._conn
+        if conn is not None:
+            try:
+                conn.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+    def _stderr_loop(self) -> None:
+        proc = self._proc
+        if proc is None or proc.stderr is None:
+            return
+
+        while not self._closed.is_set():
+            try:
+                chunk = proc.stderr.read(64 * 1024)
+            except OSError:
+                break
+            if not chunk:
+                return
+
+    def _socket_to_stdin_loop(self, conn: socket.socket) -> None:
+        proc = self._proc
+        if proc is None or proc.stdin is None:
+            return
+
+        while not self._closed.is_set():
+            try:
+                data = conn.recv(64 * 1024)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            if not data:
+                break
+
+            try:
+                proc.stdin.write(data)
+                proc.stdin.flush()
+            except (BrokenPipeError, OSError, ValueError):
+                break
+
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+
+        with self._lock:
+            if self._conn is conn:
+                self._conn = None
+
+        try:
+            conn.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+    def _cleanup_listener_path(self) -> None:
+        path = self._listen_path
+        self._listen_path = None
+        if path:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+
+        listen_dir = self._listen_dir
+        self._listen_dir = None
+        if listen_dir:
+            shutil.rmtree(listen_dir, ignore_errors=True)
+
+
 def dial(address: str) -> grpc.Channel:
     """Dial a gRPC server at address.
 
@@ -224,25 +512,37 @@ def dial_websocket(uri: str) -> grpc.Channel:
     return _ManagedChannel(channel, on_close=proxy.close)
 
 
-def dial_stdio(*_args, **_kwargs) -> grpc.Channel:
-    """Dial gRPC over stdio pipes.
+def dial_stdio(
+    command: str,
+    *args: str,
+    env: dict[str, str] | None = None,
+    cwd: str | None = None,
+) -> grpc.Channel:
+    """Dial gRPC over stdio by proxying a child process through a local socket."""
+    if not command:
+        raise ValueError("command is required")
 
-    grpcio does not expose a public transport hook to bind client channels
-    directly to stdin/stdout byte streams (unlike Go's custom dialer path).
-    """
-    raise NotImplementedError(
-        "dial_stdio is not available in python-holons: grpcio has no public stdio transport "
-        "adapter for HTTP/2 framing"
-    )
+    proxy = _StdioDialProxy((command, *args), env=env, cwd=cwd)
+    target = proxy.start()
+    channel = grpc.insecure_channel(target)
+    return _ManagedChannel(channel, on_close=proxy.close)
 
 
-def dial_uri(uri: str) -> grpc.Channel:
+def dial_uri(
+    uri: str,
+    *,
+    stdio_command: list[str] | tuple[str, ...] | None = None,
+    stdio_env: dict[str, str] | None = None,
+    stdio_cwd: str | None = None,
+) -> grpc.Channel:
     """Dial using a transport URI.
 
     Supports:
     - tcp://
     - unix://
     - mem:// (when registered in-process)
+    - stdio:// (with stdio_command)
+    - ws://, wss://
     """
     parsed = parse_uri(uri)
 
@@ -258,10 +558,16 @@ def dial_uri(uri: str) -> grpc.Channel:
     if parsed.scheme == "mem":
         return dial_mem(parsed.raw)
 
+    if parsed.scheme == "stdio":
+        if not stdio_command:
+            raise ValueError("dial_uri(stdio://) requires stdio_command")
+        cmd = list(stdio_command)
+        return dial_stdio(cmd[0], *cmd[1:], env=stdio_env, cwd=stdio_cwd)
+
     if parsed.scheme in {"ws", "wss"}:
         return dial_websocket(parsed.raw)
 
     raise ValueError(
-        f"dial_uri() supports tcp://, unix://, mem://, ws://, and wss://. "
+        f"dial_uri() supports tcp://, unix://, mem://, stdio://, ws://, and wss://. "
         f"Use transport-specific clients for {parsed.scheme}://"
     )
