@@ -3,7 +3,7 @@
   "lang": "python",
   "version": "0.1.0",
   "executables": {
-    "echo_server": "",
+    "echo_server": "python3 -m holons.echo_server",
     "echo_client": "python3 -m holons.echo_client"
   },
   "capabilities": {

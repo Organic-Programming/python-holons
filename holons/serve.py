@@ -22,6 +22,7 @@ from holons.runtime_state import register_mem_endpoint, unregister_mem_endpoint,
 logger = logging.getLogger("holons.serve")
 
 RegisterFunc = Callable[[grpc.Server], None]
+_MAX_GRPC_MESSAGE_BYTES = 1 << 20
 
 
 def parse_flags(args: list[str]) -> str:
@@ -44,13 +45,20 @@ def run_with_options(
     register_fn: RegisterFunc,
     reflect: bool = True,
     max_workers: int = 10,
+    on_listen: Callable[[str], None] | None = None,
 ) -> None:
     """Start a gRPC server on the given transport URI.
 
     Native gRPC python transports: tcp://, unix://
     Bridged transports: stdio://, mem://
     """
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=max_workers))
+    server = grpc.server(
+        futures.ThreadPoolExecutor(max_workers=max_workers),
+        options=[
+            ("grpc.max_receive_message_length", _MAX_GRPC_MESSAGE_BYTES),
+            ("grpc.max_send_message_length", _MAX_GRPC_MESSAGE_BYTES),
+        ],
+    )
     register_fn(server)
 
     reflection_enabled = False
@@ -89,6 +97,8 @@ def run_with_options(
         )
 
     mode = "reflection ON" if reflection_enabled else "reflection OFF"
+    if on_listen is not None:
+        on_listen(actual_uri)
     logger.info("gRPC server listening on %s (%s)", actual_uri, mode)
 
     server.start()
@@ -99,7 +109,7 @@ def run_with_options(
 
     def _shutdown(*_args):
         logger.info("shutting down gRPC server")
-        server.stop(5)
+        server.stop(10)
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
@@ -237,4 +247,3 @@ class _StdioServeBridge:
                 os.write(self._stdout_fd, data)
             except OSError:
                 break
-

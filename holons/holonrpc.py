@@ -37,6 +37,89 @@ class HolonRPCError(Exception):
         self.data = data
 
 
+_ROUTE_MODE_DEFAULT = ""
+_ROUTE_MODE_BROADCAST_RESPONSE = "broadcast-response"
+_ROUTE_MODE_FULL_BROADCAST = "full-broadcast"
+_MAX_HOLONRPC_MESSAGE_BYTES = 1 << 20
+
+
+@dataclass(frozen=True)
+class _RouteHints:
+    target_peer_id: str = ""
+    mode: str = _ROUTE_MODE_DEFAULT
+
+
+def _parse_route_hints(
+    method: str,
+    params: JsonObject,
+) -> tuple[str, bool, JsonObject, _RouteHints]:
+    dispatch_method = method.strip()
+    if not dispatch_method:
+        raise HolonRPCError(-32600, "invalid request")
+
+    cleaned = dict(params)
+
+    mode = _ROUTE_MODE_DEFAULT
+    if "_routing" in cleaned:
+        raw_mode = cleaned.pop("_routing")
+        if not isinstance(raw_mode, str):
+            raise HolonRPCError(-32602, "_routing must be a string")
+        mode = raw_mode.strip()
+        if mode not in {
+            _ROUTE_MODE_DEFAULT,
+            _ROUTE_MODE_BROADCAST_RESPONSE,
+            _ROUTE_MODE_FULL_BROADCAST,
+        }:
+            raise HolonRPCError(-32602, f"unsupported _routing {mode!r}")
+
+    target_peer_id = ""
+    if "_peer" in cleaned:
+        raw_peer = cleaned.pop("_peer")
+        if not isinstance(raw_peer, str):
+            raise HolonRPCError(-32602, "_peer must be a string")
+        target_peer_id = raw_peer.strip()
+        if not target_peer_id:
+            raise HolonRPCError(-32602, "_peer must be non-empty")
+
+    fan_out = dispatch_method.startswith("*.")
+    if fan_out:
+        dispatch_method = dispatch_method[2:].strip()
+        if not dispatch_method:
+            raise HolonRPCError(-32600, "invalid fan-out method")
+
+    if mode == _ROUTE_MODE_FULL_BROADCAST and not fan_out:
+        raise HolonRPCError(-32602, "full-broadcast requires a fan-out method")
+
+    return dispatch_method, fan_out, cleaned, _RouteHints(target_peer_id=target_peer_id, mode=mode)
+
+
+def _to_rpc_error(exc: Exception) -> HolonRPCError:
+    if isinstance(exc, HolonRPCError):
+        return exc
+
+    if isinstance(exc, asyncio.CancelledError):
+        message = str(exc) or "canceled"
+        return HolonRPCError(1, message)
+
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        message = str(exc) or "deadline exceeded"
+        return HolonRPCError(4, message)
+
+    message = str(exc) or "unavailable"
+    return HolonRPCError(14, message)
+
+
+def _rpc_error_payload(exc: Exception) -> JsonObject:
+    rpc_err = _to_rpc_error(exc)
+    payload: JsonObject = {
+        "code": rpc_err.code,
+        "message": rpc_err.message,
+    }
+    if rpc_err.data is not None:
+        payload["data"] = rpc_err.data
+    return payload
+
+
 class HolonRPCClient:
     """Bidirectional Holon-RPC client with heartbeat and auto-reconnect."""
 
@@ -167,6 +250,7 @@ class HolonRPCClient:
             subprotocols=["holon-rpc"],
             ping_interval=None,
             ping_timeout=None,
+            max_size=_MAX_HOLONRPC_MESSAGE_BYTES,
         )
 
         if ws.subprotocol != "holon-rpc":
@@ -459,6 +543,7 @@ class HolonRPCServer:
             subprotocols=["holon-rpc"],
             ping_interval=None,
             ping_timeout=None,
+            max_size=_MAX_HOLONRPC_MESSAGE_BYTES,
             ssl=self._ssl_context if parsed.scheme == "wss" else None,
         )
 
@@ -601,14 +686,32 @@ class HolonRPCServer:
                 await self._send_error(peer, req_id, -32602, "params must be an object")
             return
 
-        handler = self._handlers.get(method)
+        try:
+            dispatch_method, fan_out, cleaned_params, routing_hints = _parse_route_hints(method, params)
+        except HolonRPCError as exc:
+            if req_id is not None:
+                await self._send_error(peer, req_id, exc.code, exc.message, data=exc.data)
+            return
+
+        routed = await self._route_peer_request(
+            peer,
+            req_id,
+            dispatch_method,
+            cleaned_params,
+            routing_hints,
+            fan_out,
+        )
+        if routed:
+            return
+
+        handler = self._handlers.get(dispatch_method)
         if handler is None:
             if req_id is not None:
-                await self._send_error(peer, req_id, -32601, f"method {method!r} not found")
+                await self._send_error(peer, req_id, -32601, f"method {dispatch_method!r} not found")
             return
 
         try:
-            result = handler(params)
+            result = handler(cleaned_params)
             if inspect.isawaitable(result):
                 result = await result
         except HolonRPCError as exc:
@@ -648,7 +751,126 @@ class HolonRPCServer:
 
         fut.set_result(payload.get("result", {}))
 
-    async def _send_result(self, peer: _ServerPeer, req_id: Any, result: JsonObject) -> None:
+    async def _route_peer_request(
+        self,
+        caller: _ServerPeer,
+        req_id: Any,
+        method: str,
+        params: JsonObject,
+        hints: _RouteHints,
+        fan_out: bool,
+    ) -> bool:
+        if fan_out:
+            try:
+                entries = await self._dispatch_fanout(caller, method, params)
+            except HolonRPCError as exc:
+                if req_id is not None:
+                    await self._send_error(caller, req_id, exc.code, exc.message, data=exc.data)
+                return True
+
+            if hints.mode == _ROUTE_MODE_FULL_BROADCAST:
+                for entry in entries:
+                    source_peer = str(entry.get("peer", ""))
+                    notify_payload: JsonObject = {"peer": source_peer}
+                    if "error" in entry:
+                        notify_payload["error"] = entry["error"]
+                    else:
+                        notify_payload["result"] = entry.get("result", {})
+                    await self._broadcast_notification_many(
+                        {caller.id, source_peer},
+                        method,
+                        notify_payload,
+                    )
+
+            if req_id is not None:
+                await self._send_result(caller, req_id, entries)
+            return True
+
+        target_peer_id = hints.target_peer_id
+        if not target_peer_id:
+            return False
+
+        if not self._peer_exists(target_peer_id):
+            if req_id is not None:
+                await self._send_error(caller, req_id, 5, f"peer {target_peer_id!r} not found")
+            return True
+
+        try:
+            out = await self.invoke(target_peer_id, method, params)
+        except Exception as exc:
+            rpc_err = _to_rpc_error(exc)
+            if req_id is not None:
+                await self._send_error(caller, req_id, rpc_err.code, rpc_err.message, data=rpc_err.data)
+            return True
+
+        if hints.mode == _ROUTE_MODE_BROADCAST_RESPONSE:
+            await self._broadcast_notification_many(
+                {caller.id, target_peer_id},
+                method,
+                {
+                    "peer": target_peer_id,
+                    "result": out,
+                },
+            )
+
+        if req_id is not None:
+            await self._send_result(caller, req_id, out)
+        return True
+
+    async def _dispatch_fanout(
+        self,
+        caller: _ServerPeer,
+        method: str,
+        params: JsonObject,
+    ) -> list[JsonObject]:
+        target_peer_ids = self._snapshot_peer_ids_excluding(caller.id)
+        if not target_peer_ids:
+            raise HolonRPCError(5, "no connected peers")
+
+        async def _invoke_target(target_peer_id: str) -> JsonObject:
+            entry: JsonObject = {"peer": target_peer_id}
+            try:
+                entry["result"] = await self.invoke(target_peer_id, method, params)
+            except Exception as exc:
+                entry["error"] = _rpc_error_payload(exc)
+            return entry
+
+        tasks = [asyncio.create_task(_invoke_target(peer_id)) for peer_id in target_peer_ids]
+        entries: list[JsonObject] = []
+        for task in asyncio.as_completed(tasks):
+            entries.append(await task)
+        return entries
+
+    def _snapshot_peer_ids_excluding(self, excluded_peer_id: str) -> list[str]:
+        return [peer_id for peer_id in self._clients.keys() if peer_id != excluded_peer_id]
+
+    def _peer_exists(self, peer_id: str) -> bool:
+        return peer_id in self._clients
+
+    async def _broadcast_notification_many(
+        self,
+        excluded_peer_ids: set[str],
+        method: str,
+        params: JsonObject,
+    ) -> None:
+        payload: JsonObject = {
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        }
+
+        peers = [
+            peer
+            for peer_id, peer in self._clients.items()
+            if peer_id not in excluded_peer_ids
+        ]
+        for peer in peers:
+            try:
+                await self._send_json(peer.websocket, payload)
+            except Exception:
+                continue
+
+    async def _send_result(self, peer: _ServerPeer, req_id: Any, result: Any) -> None:
         payload: JsonObject = {
             "jsonrpc": "2.0",
             "id": req_id,
