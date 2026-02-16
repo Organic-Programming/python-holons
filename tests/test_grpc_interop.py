@@ -82,7 +82,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Organic-Programming/go-holons/pkg/transport"
+	"github.com/organic-programming/go-holons/pkg/transport"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 )
